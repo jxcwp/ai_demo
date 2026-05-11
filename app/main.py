@@ -7,12 +7,13 @@ import sqlite3
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, EmailStr, Field
+
+from app.services.generation_provider import generate_script
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "mvp.db"
@@ -182,20 +183,6 @@ def monthly_usage(user_id: int) -> int:
     return int(row["c"])
 
 
-def build_script(data: GenerateInput, idx: int) -> dict[str, Any]:
-    hooks = {
-        "restaurant": ["附近吃什么？", "这家店被低估了", "人均不高但很稳"],
-        "beauty": ["做完变化太明显了", "学生党也能做", "本周预约快满了"],
-    }
-    hook = hooks[data.industry][idx % 3]
-    return {
-        "title": f"{data.business_name}选题{idx + 1}: {hook}",
-        "hook_3s": f"{hook}，今天带你看{data.main_offer}",
-        "voiceover": f"这里是{data.business_name}，主打{data.main_offer}，适合{data.audience}，人均约{data.avg_ticket}。本期目标：{data.goal}。",
-        "shots": ["门头环境", "过程特写", "结果反馈"],
-        "duration_sec": 20 + (idx % 3) * 5,
-        "cta": "评论区回复关键词，领取到店福利",
-    }
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -269,7 +256,7 @@ def generate(data: GenerateInput, authorization: str | None = Header(default=Non
     limit = PLAN_LIMITS[user["plan"]]
     if used >= limit:
         raise HTTPException(status_code=402, detail="Monthly quota exceeded")
-    scripts = [build_script(data, i) for i in range(10)]
+    scripts = [generate_script(data, i) for i in range(10)]
     created_at = utcnow().isoformat()
     with get_conn() as conn:
         conn.execute("INSERT INTO generations(user_id, created_at, payload_json, result_json) VALUES (?, ?, ?, ?)", (user["id"], created_at, data.model_dump_json(), json.dumps(scripts, ensure_ascii=False)))
@@ -279,7 +266,7 @@ def generate(data: GenerateInput, authorization: str | None = Header(default=Non
 @app.post("/generate/regenerate-item")
 def regenerate_item(data: RegenerateItemInput, authorization: str | None = Header(default=None)) -> JSONResponse:
     get_current_user(authorization)
-    item = build_script(GenerateInput(**data.model_dump(exclude={"index"})), data.index + 1)
+    item = generate_script(GenerateInput(**data.model_dump(exclude={"index"})), data.index + 1)
     return JSONResponse({"index": data.index, "script": item})
 
 

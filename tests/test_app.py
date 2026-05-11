@@ -3,10 +3,11 @@ import hmac
 
 from fastapi.testclient import TestClient
 
-from app.main import BILLING_WEBHOOK_SECRET, app, get_conn
+from app.main import BILLING_WEBHOOK_SECRET, app, get_conn, init_db
 
 
 def setup_module():
+    init_db()
     with get_conn() as conn:
         conn.execute("DELETE FROM tokens")
         conn.execute("DELETE FROM orders")
