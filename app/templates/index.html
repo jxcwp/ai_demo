@@ -34,6 +34,14 @@
     </div>
     <h3>输出</h3>
     <pre id="out">尚未执行</pre>
+    <h3>管理分析看板（最小版）</h3>
+    <input id="admin_key" value="dev-admin-key" />
+    <button onclick="loadDashboard()">加载看板</button>
+    <div class="row">
+      <pre id="funnel">漏斗数据</pre>
+      <pre id="active">活跃用户</pre>
+    </div>
+    <pre id="trends">最近7日趋势</pre>
 
     <script>
       let token = '';
@@ -61,6 +69,21 @@
         };
         const res = await fetch('/generate', {method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+token}, body:j(payload)});
         out.textContent = j(await res.json());
+      }
+      async function loadDashboard() {
+        const headers = {'x-admin-key': admin_key.value};
+        const [funnelRes, trendRes] = await Promise.all([
+          fetch('/admin/analytics/funnel?window=week', {headers}),
+          fetch('/admin/analytics/trends?days=7', {headers})
+        ]);
+        const funnelData = await funnelRes.json();
+        const trendData = await trendRes.json();
+        funnel.textContent = '转化漏斗\\n' + j(funnelData);
+        active.textContent = '活跃用户（近7日）\\n' + j({
+          total_active: trendData.points.reduce((acc, p) => acc + (p.active_users || 0), 0),
+          latest_day: trendData.points[trendData.points.length - 1]
+        });
+        trends.textContent = '最近7日趋势\\n' + j(trendData);
       }
     </script>
   </body>
