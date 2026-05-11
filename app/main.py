@@ -62,6 +62,10 @@ class BillingWebhookInput(BaseModel):
     status: str = Field(pattern="^(paid|failed)$")
 
 
+class FavoriteInput(BaseModel):
+    generation_id: int
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -147,8 +151,42 @@ def init_db() -> None:
                 paid_at TEXT,
                 FOREIGN KEY(user_id) REFERENCES users(id)
             );
+
+            CREATE TABLE IF NOT EXISTS favorites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                generation_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, generation_id),
+                FOREIGN KEY(user_id) REFERENCES users(id),
+                FOREIGN KEY(generation_id) REFERENCES generations(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                event_type TEXT NOT NULL,
+                event_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
             """
         )
+
+
+def log_event(event_type: str, user_id: int | None = None, metadata: dict[str, Any] | None = None) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO events(user_id, event_type, event_at, metadata_json) VALUES (?, ?, ?, ?)",
+            (user_id, event_type, utcnow().isoformat(), json.dumps(metadata or {}, ensure_ascii=False)),
+        )
+
+
+def get_window_start(window: str) -> datetime:
+    days = {"day": 1, "week": 7, "month": 30}
+    if window not in days:
+        raise HTTPException(status_code=400, detail="window must be day/week/month")
+    return utcnow() - timedelta(days=days[window])
 
 
 @app.on_event("startup")
@@ -227,7 +265,9 @@ def register(data: RegisterInput) -> JSONResponse:
             cur = conn.execute("INSERT INTO users(email, password_salt, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", (data.email, salt, pwd_hash, now, now))
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=409, detail="Email already exists")
-    return JSONResponse({"user_id": cur.lastrowid, "plan": "free"})
+    user_id = cur.lastrowid
+    log_event("register", user_id, {"plan": "free"})
+    return JSONResponse({"user_id": user_id, "plan": "free"})
 
 
 @app.post("/auth/login")
@@ -240,6 +280,7 @@ def login(data: LoginInput) -> JSONResponse:
         now = utcnow()
         expires_at = now + timedelta(days=TOKEN_TTL_DAYS)
         conn.execute("INSERT INTO tokens(token, user_id, created_at, expires_at, revoked) VALUES (?, ?, ?, ?, 0)", (token, user["id"], now.isoformat(), expires_at.isoformat()))
+    log_event("login", user["id"], {"plan": user["plan"]})
     return JSONResponse({"token": token, "token_expires_at": expires_at.isoformat(), "user_id": user["id"], "plan": user["plan"]})
 
 
@@ -273,7 +314,23 @@ def generate(data: GenerateInput, authorization: str | None = Header(default=Non
     created_at = utcnow().isoformat()
     with get_conn() as conn:
         conn.execute("INSERT INTO generations(user_id, created_at, payload_json, result_json) VALUES (?, ?, ?, ?)", (user["id"], created_at, data.model_dump_json(), json.dumps(scripts, ensure_ascii=False)))
+    log_event("generate", user["id"], {"industry": data.industry})
     return JSONResponse({"created_at": created_at, "scripts": scripts, "remaining": limit - used - 1})
+
+
+@app.post("/favorites")
+def favorite_generation(data: FavoriteInput, authorization: str | None = Header(default=None)) -> JSONResponse:
+    user = get_current_user(authorization)
+    with get_conn() as conn:
+        exists = conn.execute("SELECT id FROM generations WHERE id=? AND user_id=?", (data.generation_id, user["id"])).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="Generation not found")
+        conn.execute(
+            "INSERT OR IGNORE INTO favorites(user_id, generation_id, created_at) VALUES (?, ?, ?)",
+            (user["id"], data.generation_id, utcnow().isoformat()),
+        )
+    log_event("favorite", user["id"], {"generation_id": data.generation_id})
+    return JSONResponse({"ok": True, "generation_id": data.generation_id})
 
 
 @app.post("/generate/regenerate-item")
@@ -307,7 +364,9 @@ def create_order(plan: str = Query(pattern="^(basic|pro)$"), authorization: str 
     amount = 2900 if plan == "basic" else 9900
     with get_conn() as conn:
         cur = conn.execute("INSERT INTO orders(user_id, plan, amount, status, created_at) VALUES (?, ?, ?, 'pending', ?)", (user["id"], plan, amount, utcnow().isoformat()))
-    return JSONResponse({"order_id": cur.lastrowid, "amount": amount, "status": "pending"})
+    order_id = cur.lastrowid
+    log_event("create_order", user["id"], {"plan": plan, "order_id": order_id, "amount": amount})
+    return JSONResponse({"order_id": order_id, "amount": amount, "status": "pending"})
 
 
 @app.post("/billing/webhook")
@@ -326,9 +385,77 @@ def billing_webhook(data: BillingWebhookInput, x_signature: str | None = Header(
                 return JSONResponse({"ok": True, "order_id": data.order_id, "idempotent": True})
             conn.execute("UPDATE orders SET status='paid', paid_at=? WHERE id=?", (utcnow().isoformat(), data.order_id))
             conn.execute("UPDATE users SET plan=?, updated_at=? WHERE id=?", (order["plan"], utcnow().isoformat(), order["user_id"]))
+            conn.execute(
+                "INSERT INTO events(user_id, event_type, event_at, metadata_json) VALUES (?, 'payment_success', ?, ?)",
+                (order["user_id"], utcnow().isoformat(), json.dumps({"order_id": data.order_id, "plan": order["plan"]}, ensure_ascii=False)),
+            )
         else:
             conn.execute("UPDATE orders SET status='failed' WHERE id=?", (data.order_id,))
     return JSONResponse({"ok": True, "order_id": data.order_id, "status": data.status})
+
+
+@app.get("/analytics/summary")
+def analytics_summary(
+    authorization: str | None = Header(default=None), window: str = Query(default="week")
+) -> JSONResponse:
+    get_current_user(authorization)
+    start = get_window_start(window).isoformat()
+    funnel_steps = ["register", "login", "generate", "favorite", "create_order", "payment_success"]
+    with get_conn() as conn:
+        active_users = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) c FROM events WHERE event_at >= ? AND user_id IS NOT NULL", (start,)
+        ).fetchone()["c"]
+        counts = {
+            step: conn.execute(
+                "SELECT COUNT(*) c FROM events WHERE event_type = ? AND event_at >= ?", (step, start)
+            ).fetchone()["c"]
+            for step in funnel_steps
+        }
+    base = counts["register"] or 0
+    rates = {step: (round((counts[step] / base) * 100, 2) if base else 0.0) for step in funnel_steps}
+    return JSONResponse({"window": window, "start_at": start, "active_users": active_users, "funnel_counts": counts, "funnel_rates": rates})
+
+
+@app.get("/admin/analytics/funnel")
+def admin_analytics_funnel(x_admin_key: str | None = Header(default=None), window: str = Query(default="week")) -> JSONResponse:
+    validate_admin_key(x_admin_key)
+    start = get_window_start(window).isoformat()
+    funnel_steps = ["register", "login", "generate", "favorite", "create_order", "payment_success"]
+    with get_conn() as conn:
+        unique_counts = {
+            step: conn.execute(
+                "SELECT COUNT(DISTINCT user_id) c FROM events WHERE event_type = ? AND event_at >= ? AND user_id IS NOT NULL",
+                (step, start),
+            ).fetchone()["c"]
+            for step in funnel_steps
+        }
+    first = unique_counts["register"] or 0
+    conversion = {step: (round(unique_counts[step] / first, 4) if first else 0.0) for step in funnel_steps}
+    return JSONResponse({"window": window, "start_at": start, "steps": funnel_steps, "unique_users": unique_counts, "conversion": conversion})
+
+
+@app.get("/admin/analytics/trends")
+def admin_analytics_trends(x_admin_key: str | None = Header(default=None), days: int = Query(default=7, ge=1, le=30)) -> JSONResponse:
+    validate_admin_key(x_admin_key)
+    start_date = utcnow().date() - timedelta(days=days - 1)
+    points: list[dict[str, Any]] = []
+    with get_conn() as conn:
+        for i in range(days):
+            d = (start_date + timedelta(days=i)).isoformat()
+            next_d = (start_date + timedelta(days=i + 1)).isoformat()
+            row = conn.execute(
+                """
+                SELECT
+                  SUM(CASE WHEN event_type='register' THEN 1 ELSE 0 END) AS register_count,
+                  SUM(CASE WHEN event_type='generate' THEN 1 ELSE 0 END) AS generate_count,
+                  SUM(CASE WHEN event_type='payment_success' THEN 1 ELSE 0 END) AS payment_count,
+                  COUNT(DISTINCT user_id) AS active_users
+                FROM events WHERE event_at >= ? AND event_at < ?
+                """,
+                (f"{d}T00:00:00+00:00", f"{next_d}T00:00:00+00:00"),
+            ).fetchone()
+            points.append({"date": d, "register": row["register_count"] or 0, "generate": row["generate_count"] or 0, "payment_success": row["payment_count"] or 0, "active_users": row["active_users"] or 0})
+    return JSONResponse({"days": days, "points": points})
 
 
 @app.get("/calendar/weekly")
