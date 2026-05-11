@@ -19,8 +19,17 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
+## 数据库迁移（Alembic）
+```bash
+alembic upgrade head
+alembic downgrade -1
+```
+
 ## 环境变量
 - `APP_ENV` 默认 `dev`
 - `ADMIN_KEY` 默认 `dev-admin-key`（prod必须覆盖）
 - `TOKEN_TTL_DAYS` 默认 `30`
 - `BILLING_WEBHOOK_SECRET` 默认 `dev-webhook-secret`
+
+
+- `DATABASE_URL` 默认 `sqlite:///./mvp.db`，可切换为 PostgreSQL（如 `postgresql+psycopg2://user:pass@host:5432/dbname`）
