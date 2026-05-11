@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI短视频脚本生成器</title>
+    <style>
+      body { font-family: Arial, sans-serif; max-width: 980px; margin: 2rem auto; }
+      input, select, button { padding: .5rem; margin: .25rem 0; width: 100%; }
+      pre { background: #f6f6f6; padding: 1rem; white-space: pre-wrap; }
+      .row { display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
+    </style>
+  </head>
+  <body>
+    <h1>AI短视频脚本生成器（完整功能版）</h1>
+    <div class="row">
+      <section>
+        <h3>1) 注册/登录</h3>
+        <input id="email" value="demo@example.com" />
+        <input id="password" type="password" value="123456" />
+        <button onclick="register()">注册</button>
+        <button onclick="login()">登录</button>
+      </section>
+      <section>
+        <h3>2) 生成脚本</h3>
+        <select id="industry"><option value="restaurant">餐饮</option><option value="beauty">美业</option></select>
+        <input id="business_name" value="赣州示例门店" />
+        <input id="main_offer" value="双人晚餐套餐" />
+        <input id="avg_ticket" value="89元" />
+        <input id="audience" value="附近上班族" />
+        <input id="goal" value="到店引流" />
+        <button onclick="generate()">生成10条</button>
+      </section>
+    </div>
+    <h3>输出</h3>
+    <pre id="out">尚未执行</pre>
+
+    <script>
+      let token = '';
+      const out = document.getElementById('out');
+      const j = (v) => JSON.stringify(v, null, 2);
+
+      async function register() {
+        const res = await fetch('/auth/register', {method:'POST', headers:{'Content-Type':'application/json'}, body: j({email: email.value, password: password.value})});
+        out.textContent = j(await res.json());
+      }
+      async function login() {
+        const res = await fetch('/auth/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: j({email: email.value, password: password.value})});
+        const data = await res.json();
+        token = data.token || '';
+        out.textContent = j(data);
+      }
+      async function generate() {
+        const payload = {
+          industry: industry.value,
+          business_name: business_name.value,
+          main_offer: main_offer.value,
+          avg_ticket: avg_ticket.value,
+          audience: audience.value,
+          goal: goal.value
+        };
+        const res = await fetch('/generate', {method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+token}, body:j(payload)});
+        out.textContent = j(await res.json());
+      }
+    </script>
+  </body>
+</html>
